@@ -1,0 +1,55 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=5G
+
+source ./project.sh
+set -eux
+
+PREFIX=${STUDY_PREFIX}_to_DSURQE
+TARGET=${STUDY_PREFIX}_template0.nii.gz
+TAR_LAP=${STUDY_PREFIX}_template0_lapnorm.nii.gz
+TEMPLATE=$DSURQE
+TEMP_MASK=$DSURQE_MASK
+TEMP_LAP=$DSURQE_DIR/DSURQE_100micron_average_lapnorm.nii.gz
+
+cd $TEMPLATE_DIR
+
+function laplacians() {
+    ants ImageMath 3 $TAR_LAP Laplacian $TARGET 0.16 1
+    ants ImageMath 3 $TAR_LAP Normalize $TAR_LAP
+}
+
+function register() {
+    ants antsRegistration --collapse-output-transforms 1 --dimensionality 3 --float 1 \
+    --initialize-transforms-per-stage 0 \
+    --interpolation LanczosWindowedSinc --output [ ${PREFIX}_, ${PREFIX}_Warped.nii.gz ] \
+    --transform Rigid[ 0.1 ] \
+    --metric MI[ $TEMPLATE, $TARGET, 0.5, 32, Regular, 0.25 ] \
+    --convergence [ 1000x500x250x100, 1e-08, 10 ] --smoothing-sigmas 4.0x2.0x1.0x0.0vox \
+    --shrink-factors 8x4x2x1 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    --transform Affine[ 0.1 ] \
+    --metric MI[ $TEMPLATE, $TARGET, 1, 32, Regular, 0.25 ] \
+    --convergence [ 50x50x10x0, 1e-08, 10 ] --smoothing-sigmas 4.0x2.0x1.0x0.0vox \
+    --shrink-factors 8x4x2x1 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    --transform SyN[ 0.05, 6.0, 0.0 ] \
+    --metric CC[ $TEMPLATE, $TARGET, 0.4, 4, None, 1 ] \
+    --metric CC[ $TEMP_LAP, $TAR_LAP, 0.6, 4, None, 1 ] \
+    --convergence [ 100x50, 1e-06, 10 ] --smoothing-sigmas 2.0x1.0vox \
+    --shrink-factors 4x2 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    -v --winsorize-image-intensities [ 0.01, 0.975 ]  --write-composite-transform 0 
+}
+
+function mask() {   
+    ants antsApplyTransforms -d 3 -n NearestNeighbor \
+        -i $TEMP_MASK -r $TARGET -o $STUDY_MASK \
+        -t "[${PREFIX}_0GenericAffine.mat,1]" -t ${PREFIX}_1InverseWarp.nii.gz
+    
+    ants ImageMath 3 $STUDY_REGMASK MD $STUDY_MASK 2
+
+    fslmaths $TARGET -mas $STUDY_MASK ${TARGET%.nii.gz}_masked.nii.gz
+}
+
+laplacians
+register
+mask

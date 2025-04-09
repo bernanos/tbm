@@ -1,0 +1,84 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=5G
+#SBATCH --time=3-23:59
+# #SBATCH --nodelist=grid07
+
+source ./project.sh
+set -eux
+
+INDEX=$1
+SUBJ="`awk FNR==$SLURM_ARRAY_TASK_ID $INDEX`"
+
+
+mkdir -p $REG_DIR/anat
+mkdir -p $REG_DIR/dwi
+
+PREFIX="$REG_DIR/anat/${SUBJ}_totemplate"
+FIXED1="$STUDY_TEMPLATE0"
+FIXED2="$STUDY_TEMPLATE1"
+FIXED3="$STUDY_TEMPLATE2"
+FIXED4="$STUDY_TEMPLATE3"
+MOVING1="$PROC_DIR/$SUBJ/anat/${SUBJ}_desc-aligned_T2w.nii.gz"
+MOVING2="$PROC_DIR/$SUBJ/anat/${SUBJ}_desc-aligned_UNIT1.nii.gz"
+MOVING3="$PROC_DIR/$SUBJ/dwi/${SUBJ}_dti_desc-aligned_FA.nii.gz"
+MOVING4="$PROC_DIR/$SUBJ/dwi/${SUBJ}_dti_desc-aligned_MD.nii.gz"
+SUBJ_REGMASK="$PROC_DIR/$SUBJ/anat/${SUBJ}_desc-aligned_regmask.nii.gz"
+
+function register() {
+  ants ImageMath 3 $SUBJ_REGMASK MD $PROC_DIR/$SUBJ/anat/${SUBJ}_desc-aligned_artsmask.nii.gz 2
+
+  ants antsRegistration --verbose 1 --dimensionality 3 \
+    --use-histogram-matching 1 --winsorize-image-intensities [0.01,0.99] \
+    --initial-moving-transform [$FIXED1,$MOVING1,1] \
+    --transform Rigid[0.1] \
+    --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+    --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+    --transform Affine[0.1] \
+    --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+    --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+    --transform SyN[0.1] \
+    --metric CC[$FIXED1,$MOVING1,1,4] \
+    --metric CC[$FIXED2,$MOVING2,1,4] \
+    --metric CC[$FIXED3,$MOVING3,1,4] \
+    --metric CC[$FIXED4,$MOVING4,1,4] \
+    --convergence 200x200x200x200 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+    --masks [$STUDY_REGMASK,$SUBJ_REGMASK] \
+    --output [${PREFIX}_,${PREFIX}_Warped.nii.gz]
+}
+
+
+function applytransforms() {
+  ants antsApplyTransforms -d 3 -i $PROC_DIR/$SUBJ/anat/${SUBJ}_desc-aligned_T1map.nii.gz \
+    -r $FIXED1 -o $REG_DIR/anat/${SUBJ}_T1map.nii.gz \
+    -t ${PREFIX}_1Warp.nii.gz -t ${PREFIX}_0GenericAffine.mat
+
+  ants antsApplyTransforms -d 3 -i $PROC_DIR/$SUBJ/dwi/${SUBJ}_dti_desc-aligned_FA.nii.gz \
+    -r $FIXED1 -o $REG_DIR/dwi/${SUBJ}_FA.nii.gz \
+    -t ${PREFIX}_1Warp.nii.gz -t ${PREFIX}_0GenericAffine.mat
+
+  ants antsApplyTransforms -d 3 -i $PROC_DIR/$SUBJ/dwi/${SUBJ}_dti_desc-aligned_MD.nii.gz \
+    -r $FIXED1 -o $REG_DIR/dwi/${SUBJ}_MD.nii.gz \
+    -t ${PREFIX}_1Warp.nii.gz -t ${PREFIX}_0GenericAffine.mat
+}
+
+function smoothmaps() {
+  FWHM=0.2
+
+  afni 3dBlurInMask -overwrite -input $REG_DIR/anat/${SUBJ}_T1map.nii.gz \
+    -FWHM $FWHM -mask $STUDY_MASK \
+    -prefix $REG_DIR/anat/${SUBJ}_desc-blurred_T1map.nii.gz
+  
+  afni 3dBlurInMask -overwrite -input $REG_DIR/dwi/${SUBJ}_FA.nii.gz \
+    -FWHM $FWHM -mask $STUDY_MASK \
+    -prefix $REG_DIR/dwi/${SUBJ}_desc-blurred_FA.nii.gz
+  
+  afni 3dBlurInMask -overwrite -input $REG_DIR/dwi/${SUBJ}_MD.nii.gz \
+    -FWHM $FWHM -mask $STUDY_MASK \
+    -prefix $REG_DIR/dwi/${SUBJ}_desc-blurred_MD.nii.gz
+}
+
+# register
+# applytransforms
+smoothmaps

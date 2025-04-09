@@ -1,0 +1,144 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=2G
+
+PATH=/software/local/brain/Toby:$PATH
+source ./project.sh
+module switch quit/3.3b
+set -eux
+
+INDEX=$1
+SUBJECTS="`awk FNR==$SLURM_ARRAY_TASK_ID $INDEX`"
+readarray -d _ -t SUBJARR <<< "${SUBJECTS#sub-}"
+BETA=1
+
+echo "Processing: $SUBJECTS"
+
+####### folder definitions #######
+CODE_DIR=/nan/ceph/network/local/generic/brain
+MP2_DIR=$CODE_DIR/processing_scripts/Mouse_4Head_exvivo
+SRC_DIR=$RAW_DIR/$SUBJECTS
+OUT_DIR=$PROC_DIR/$SUBJECTS
+ANAT_DIR=$OUT_DIR/anat
+mkdir -p $ANAT_DIR
+cd $ANAT_DIR
+
+###### filename definitions ######
+if [ $# == 1 ]; then
+    PREFIX="$SUBJECTS"
+    MP2_JSON=$MP2_DIR/mp2rage_exvivo.json
+elif [ $# == 2 ]; then
+    PREFIX="${SUBJECTS}_${2}"
+    MP2_JSON=$SCRIPT_DIR/mp2rage_${2}.json
+fi
+MP2_MAG=$SRC_DIR/anat/${PREFIX}_part-mag_MP2RAGE.nii.gz
+MP2_REALIMAG=$SRC_DIR/anat/${PREFIX}_part-comp_MP2RAGE.nii.gz
+MP2_CPX=$ANAT_DIR/${PREFIX}_part-comp_MP2RAGE.nii.gz
+MP2_TI1=$SRC_DIR/anat/${PREFIX}_inv-1_part-mag_MP2RAGE.nii.gz
+MP2_TI2=$SRC_DIR/anat/${PREFIX}_inv-2_part-mag_MP2RAGE.nii.gz
+MP2_UNIT1=$ANAT_DIR/${PREFIX}_UNIT1.nii.gz
+if compgen -G "${PREFIX}_*_T1map.nii.gz" > /dev/null; then
+    MP2_T1=$ANAT_DIR/${PREFIX}_acq-mp2rage_T1map.nii.gz
+else
+    MP2_T1=$ANAT_DIR/${PREFIX}_T1map.nii.gz
+fi
+MP2_MASK=$ANAT_DIR/${PREFIX}_mask_MP2RAGE.nii.gz
+MP2_LABELS=$ANAT_DIR/${PREFIX}_labels_MP2RAGE.nii.gz
+
+###### function definitions ######
+function split_TIs() {
+    echo "Splitting TI images..."
+    fslroi $MP2_MAG $MP2_TI1 0 1
+    fslroi $MP2_MAG $MP2_TI2 1 1
+
+    qi mask $MP2_TI2 -o $MP2_MASK
+}
+
+
+function mp2rage() {
+    # convert from separate real and imag images to complex value image
+    qi complex --realimag=$MP2_REALIMAG -X $MP2_CPX
+
+    echo "Calculating T1 map..."
+
+    qi mp2rage -v $MP2_CPX -o ${PREFIX}_ -b $BETA --json=$MP2_JSON
+
+    mv ${PREFIX}_MP2_UNI.nii.gz $MP2_UNIT1
+    mv ${PREFIX}_MP2_T1.nii.gz $MP2_T1
+
+}
+
+function align_intrasubject() {
+    MOVING=$1
+    FIXED=$2
+    PREFIX=$3
+    ants antsRegistration --verbose 1 --dimensionality 3 --float 0 \
+        --output [$PREFIX, ] \
+        --interpolation Linear --use-histogram-matching 1 --winsorize-image-intensities [0.005,0.995] \
+        --initial-moving-transform "[$FIXED,$MOVING,1]" \
+        --transform Rigid[0.1] --metric MI[$FIXED,$MOVING,1,32,Regular,0.25] \
+        --convergence 1000x500x250x100 --shrink-factors 8x4x2x1 --smoothing-sigmas 3x2x1x0vox
+}
+
+function align_to_atlas() {
+    INPUT=$1
+    OUTPUT=$2
+    shift 2
+    TFMS="$@"
+
+    ants antsApplyTransforms -d 3 -i $INPUT -r $DSURQE -o $OUTPUT $TFMS
+}
+
+function split_heads() {
+    # split heads into individual images
+    IMAGES=($MP2_UNIT1 $MP2_T1)
+    for IMAGE in ${IMAGES[@]}; do
+        MODALITY=${IMAGE##*_}
+        MODALITY=${MODALITY%.nii.gz}
+
+        $TBM_SCRIPT_DIR/split4HeadExvivo.py  \
+            $IMAGE \
+            $MP2_MASK $MP2_LABELS \
+            -o $ORIENTATION -v IS
+
+        SPLIT_IMAGES=($(ls -d ${IMAGE%.nii.gz}_?.nii.gz))
+        for (( n=0; n < ${#SPLIT_IMAGES[@]}; n++ )); do
+            FNAME=$( basename ${SPLIT_IMAGES[n]} )
+            FNAME=${FNAME##*${SUBJECTS}}
+            FNAME=${FNAME%%.*}
+            IDX=${FNAME: -1}
+            FNAME=${FNAME%_?}
+            SUBJ=$( echo "sub-${SUBJARR[IDX-1]}" | tr -d '\n' )
+            if [ $SUBJ == 'none' ] || [ $SUBJ == 'x' ]; then
+                continue
+            fi
+            SUBJ_DIR="$PROC_DIR/$SUBJ/anat"
+            mkdir -p $SUBJ_DIR
+            OUTNAME="$SUBJ_DIR/${SUBJ}${FNAME}.nii.gz"
+            mv ${SPLIT_IMAGES[n]} $OUTNAME
+            if [[ $IMAGE == $MP2_UNIT1 ]]; then
+            align_intrasubject $OUTNAME \
+                $SUBJ_DIR/${SUBJ}_T2w.nii.gz \
+                $SUBJ_DIR/${SUBJ}_MP2toT2w_
+            fi
+            TFMS="-t $SUBJ_DIR/${SUBJ}_0GenericAffine.mat -t $SUBJ_DIR/${SUBJ}.tfm -t $SUBJ_DIR/${SUBJ}_MP2toT2w_0GenericAffine.mat"
+            ALIGNED="${OUTNAME%_${MODALITY}.nii.gz}_desc-aligned_${MODALITY}.nii.gz"
+            align_to_atlas $OUTNAME $ALIGNED $TFMS
+        done
+    done
+}
+
+
+if [ ! -f $MP2_TI2 ]; then
+    split_TIs
+fi
+if [ ! -f ${PREFIX}_UNIT1.nii.gz ]; then
+    mp2rage
+fi
+last_subj=${SUBJARR[-1]}
+if compgen -G "$PROC_DIR/$last_subj/anat/${last_subj}_*T1map.nii.gz" > /dev/null; then
+    exit
+else
+    split_heads
+fi

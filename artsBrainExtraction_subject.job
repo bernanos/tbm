@@ -1,0 +1,62 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=10G
+
+source ./project.sh
+set -eux
+
+INDEX=$1
+SUBJ="`awk FNR==$SLURM_ARRAY_TASK_ID $INDEX`"
+echo "Processing FLASH for subject: $SUBJ"
+SUBJ_DIR=$PROC_DIR/$SUBJ/anat
+cd $SUBJ_DIR
+
+PREFIX=${SUBJ}_to_DSURQE
+RAW=${SUBJ}_T2w.nii.gz
+TARGET=${SUBJ}_desc-aligned_T2w.nii.gz
+TAR_LAP=${SUBJ}_desc-alignedlapnorm_T2w.nii.gz
+TAR_GRAD=${SUBJ}_desc-alignedgradnorm_T2w.nii.gz
+TEMPLATE=$DSURQE
+TEMP_MASK=$DSURQE_MASK
+TEMP_LAP=${DSURQE%.nii.gz}_lapnorm.nii.gz
+
+function laplacians() {
+    ants ImageMath 3 $TAR_LAP Laplacian $TARGET 0.2 1
+    ants ImageMath 3 $TAR_LAP Normalize $TAR_LAP
+}
+
+function register() {
+    ants antsRegistration --collapse-output-transforms 1 --dimensionality 3 --float 1 \
+    --initialize-transforms-per-stage 0 \
+    --interpolation LanczosWindowedSinc --output [ ${PREFIX}_, ${PREFIX}_Warped.nii.gz ] \
+    --transform Rigid[ 0.1 ] \
+    --metric MI[ $TEMPLATE, $TARGET, 0.5, 32, Regular, 0.25 ] \
+    --convergence [ 1000x500x250x100, 1e-08, 10 ] --smoothing-sigmas 4.0x2.0x1.0x0.0vox \
+    --shrink-factors 8x4x2x1 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    --transform Affine[ 0.1 ] \
+    --metric MI[ $TEMPLATE, $TARGET, 1, 32, Regular, 0.25 ] \
+    --convergence [ 50x50x10x0, 1e-08, 10 ] --smoothing-sigmas 4.0x2.0x1.0x0.0vox \
+    --shrink-factors 8x4x2x1 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    --transform SyN[ 0.05, 6.0, 0.0 ] \
+    --metric CC[ $TEMPLATE, $TARGET, 0.4, 4, None, 1 ] \
+    --metric CC[ $TEMP_LAP, $TAR_LAP, 0.6, 4, None, 1 ] \
+    --convergence [ 100x50, 1e-06, 10 ] --smoothing-sigmas 2.0x1.0vox \
+    --shrink-factors 4x2 --use-histogram-matching 1 --masks [ $TEMP_MASK, NULL ] \
+    -v --winsorize-image-intensities [ 0.01, 0.975 ]  --write-composite-transform 0 
+}
+
+function warp_masks() {   
+    ants antsApplyTransforms -d 3 -n NearestNeighbor \
+        -i $TEMP_MASK -r $RAW -o ${SUBJ}_artsmask.nii.gz \
+        -t "[${SUBJ}.tfm,1]" -t "[${SUBJ}_0GenericAffine.mat,1]" \
+        -t "[${PREFIX}_0GenericAffine.mat,1]" -t ${PREFIX}_1InverseWarp.nii.gz
+    
+    ants antsApplyTransforms -d 3 -n NearestNeighbor \
+        -i $TEMP_MASK -r $TARGET -o ${SUBJ}_desc-aligned_artsmask.nii.gz \
+        -t "[${PREFIX}_0GenericAffine.mat,1]" -t ${PREFIX}_1InverseWarp.nii.gz
+}
+
+laplacians
+register
+warp_masks

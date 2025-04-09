@@ -1,0 +1,85 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=10G
+
+source ./project.sh
+set -eux
+
+INDEX=$1
+SUBJECTS="`awk FNR==$SLURM_ARRAY_TASK_ID $INDEX`"
+
+readarray -d _ -t SUBJARR <<< "${SUBJECTS#sub-}"
+
+SRC_DIR="$RAW_DIR/$SUBJECTS/anat"
+MAGIMG="$SRC_DIR/${SUBJECTS}_T2w.nii.gz"
+MASK="$SRC_DIR/${SUBJECTS}_mask.nii.gz"
+LABELS="$SRC_DIR/${SUBJECTS}_labels.nii.gz"
+
+function align_to_atlas() {
+    IDX=$1
+    INPUT=$2
+    OUTPUT=$3
+
+    ANGLE=$(( -315 - 90 * ($IDX - 1) ))
+    qi affine --rotate=0,$ANGLE,0 --tfm=${OUTPUT}.tfm $INPUT ${OUTPUT}_rotY.nii.gz
+    ANGLE=$(( -1 * $ANGLE ))
+    qi affine --rotate=0,$ANGLE,0 $INPUT ${OUTPUT}_rotY.nii.gz
+
+    ants antsRegistration --verbose 1 --dimensionality 3 \
+    --output [${OUTPUT}_] \
+    --use-histogram-matching 1 --winsorize-image-intensities [0.01,0.99] \
+    --initial-moving-transform [$DSURQE, ${OUTPUT}_rotY.nii.gz, 1] \
+    --transform Rigid[0.1] --metric MI[$DSURQE, ${OUTPUT}_rotY.nii.gz, 1, 32, Regular, 0.25] \
+    --convergence 1000x500x250 --shrink-factors 8x4x2 --smoothing-sigmas 4x2x1vox
+
+    rm ${OUTPUT}_rotY.nii.gz
+}
+
+function apply_transforms() {
+    INPUT=$1
+    PREFIX=$2
+    OUTPUT=$3
+
+    TFMS="-t ${PREFIX}_0GenericAffine.mat -t ${PREFIX}.tfm"
+    ants antsApplyTransforms -d 3 -i $INPUT -r $DSURQE -o $OUTPUT $TFMS
+}
+
+###### create head masks ######
+if [ ! -f $MASK ]; then
+    qi mask $MAGIMG -o $MASK
+    fslmaths $MASK -kernel sphere 0.2 -dilF -fillh26 -eroF $MASK -odt short
+fi
+
+IMAGE=$SRC_DIR/${SUBJECTS}_T2w.nii.gz
+
+######### split heads #########
+$TBM_SCRIPT_DIR/split4HeadExvivo.py  \
+    $IMAGE \
+    $MASK $LABELS \
+    -o $ORIENTATION -v IS
+
+##### move and align heads #####
+SPLIT_IMAGES=($(ls -d ${IMAGE%.nii.gz}_?.nii.gz))
+for (( n=0; n < ${#SPLIT_IMAGES[@]}; n++ )); do
+    FNAME=$( basename ${SPLIT_IMAGES[n]} )
+    FNAME=${FNAME##*${SUBJECTS}}
+    FNAME=${FNAME%%.*}
+    IDX=${FNAME: -1}
+    FNAME=${FNAME%_?}
+    SUBJ=$( echo "sub-${SUBJARR[IDX-1]}" | tr -d '\n' )
+    if [ $SUBJ == 'none' ] || [ $SUBJ == 'x' ]; then
+        continue
+    fi
+    echo $SUBJ >> $SCRIPT_DIR/subjects.txt
+    SUBJ_DIR="$PROC_DIR/$SUBJ/anat"
+    mkdir -p $SUBJ_DIR
+    OUTNAME="$SUBJ_DIR/${SUBJ}${FNAME}.nii.gz"
+    mv ${SPLIT_IMAGES[n]} $OUTNAME
+
+    align_to_atlas $IDX $OUTNAME $SUBJ_DIR/$SUBJ
+
+    ALIGNED="${OUTNAME%_T2w.nii.gz}_desc-aligned_T2w.nii.gz"
+    apply_transforms $OUTNAME $SUBJ_DIR/$SUBJ $ALIGNED
+
+done

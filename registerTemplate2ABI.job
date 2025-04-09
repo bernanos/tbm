@@ -1,0 +1,51 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=50G
+#SBATCH --time=11-23:59
+
+source ./project.sh
+set -eux
+
+PREFIX=$TEMPLATE_DIR/${STUDY_PREFIX}-to-CCFv3
+# FIXED1=$ATLAS_DIR/ABI_template/ABI_MRI_template.nii.gz
+# FIXED2=$ATLAS_DIR/ABI_template/ABI_CCFv3_Template_masked_grad.nii.gz
+FIXED1=$ATLAS_DIR/ABI_template/ABI_MRI_template_100um.nii.gz
+MOVING1=$TEMPLATE_DIR/${STUDY_PREFIX}_template0_masked.nii.gz
+# MOVING2=$TEMPLATE_DIR/${STUDY_PREFIX}_template0_masked_grad.nii.gz
+# MASK=$ATLAS_DIR/ABI_template/ABI_CCFv3_regmask.nii.gz
+
+# ants ImageMath 3 $MOVING2 Grad $MOVING1 0.08 1
+
+# ants antsRegistration --verbose 1 --dimensionality 3 \
+#   --use-histogram-matching 1 --winsorize-image-intensities [0.01,0.99] \
+#   --initial-moving-transform [$FIXED1,$MOVING1,1] \
+#   --transform Rigid[0.1] \
+#   --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+#   --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+#   --transform Affine[0.1] \
+#   --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+#   --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+#   --transform SyN[0.1] \
+#   --metric CC[$FIXED1,$MOVING1,1,4] \
+#   --metric CC[$FIXED2,$MOVING2,1,4] \
+#   --convergence 200x200x200x200 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+#   --masks $MASK \
+#   --output [${PREFIX}_,${PREFIX}_Warped.nii.gz]
+  
+ants antsRegistration --verbose 1 --dimensionality 3 \
+  --use-histogram-matching 1 --winsorize-image-intensities [0.01,0.99] \
+  --initial-moving-transform [$FIXED1,$MOVING1,1] \
+  --transform Rigid[0.1] \
+  --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+  --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+  --transform Affine[0.1] \
+  --metric MI[$FIXED1,$MOVING1,1,32,Regular,0.25] \
+  --convergence 1000x500x250x0 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+  --transform SyN[0.1] \
+  --metric CC[$FIXED1,$MOVING1,1,4] \
+  --convergence 200x200x200x200 --shrink-factors 6x4x2x1 --smoothing-sigmas 3x2x1x0vox \
+  --output [${PREFIX}_,${PREFIX}_Warped.nii.gz]
+
+ants antsApplyTransforms -d 3 -i $ABI_LABELS -r $MOVING1 -o $STUDY_DCLABELS -n MultiLabel \
+  -t [ ${PREFIX}_0GenericAffine.mat , 1 ] -t ${PREFIX}_1InverseWarp.nii.gz

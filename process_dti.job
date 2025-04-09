@@ -1,0 +1,111 @@
+#!/bin/bash 
+
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=1G
+
+source ./project.sh
+set -eux
+
+INDEX=$1
+SUBJECTS="`awk FNR==$SLURM_ARRAY_TASK_ID $INDEX`"
+if [ $# == 1 ]; then
+    PREFIX="$SUBJECTS"
+elif [ $# == 2 ]; then
+    PREFIX="${SUBJECTS}_${2}"
+fi
+readarray -d _ -t SUBJARR <<< "${SUBJECTS#sub-}"
+
+echo "Processing DTI for subject: $SUBJECTS"
+
+SRC_DIR="$RAW_DIR/$SUBJECTS/dwi"
+OUT_DIR="$PROC_DIR/$SUBJECTS/dwi"
+mkdir -p $OUT_DIR
+cd $OUT_DIR
+
+DTI_MAG="$SRC_DIR/${PREFIX}_part-mag_dwi.nii.gz"
+DTI_PHASE="$SRC_DIR/${PREFIX}_part-phase_dwi.nii.gz"
+DTI_DENOISED="$OUT_DIR/${PREFIX}_desc-denoised_dwi.nii.gz"
+DTI_DENOISED_MAG="$OUT_DIR/${PREFIX}_desc-denoisedmag_dwi.nii.gz"
+DTI_PREPROC="$OUT_DIR/${PREFIX}_desc-preproc_dwi.nii.gz"
+DTI_BVALS="${DTI_MAG%.nii*}.bval"
+DTI_BVECS="${DTI_MAG%.nii*}.bvec"
+DTI_MASK="$OUT_DIR/${PREFIX}_dti_mask.nii.gz"
+DTI_LABELS="$OUT_DIR/${PREFIX}_dti_labels.nii.gz"
+
+function preproc() {
+    qi mask --fillh=2 -o $DTI_MASK $DTI_MAG
+
+    mrcalc $DTI_MAG $DTI_PHASE -polar - | \
+        dwidenoise - -force -mask $DTI_MASK $DTI_DENOISED
+    mrcalc $DTI_DENOISED -force -abs $DTI_DENOISED_MAG
+    mrdegibbs $DTI_DENOISED_MAG -force -mode 2d $DTI_PREPROC
+}
+
+function do_dti() {
+    dtifit -k $DTI_PREPROC -m $DTI_MASK -r $DTI_BVECS -b $DTI_BVALS -o $OUT_DIR/${PREFIX}_dti --verbose --wls
+}
+
+function align_intrasubject() {
+    MOVING=$1
+    FIXED=$2
+    PREFIX=$3
+    ants antsRegistration --verbose 1 --dimensionality 3 --float 0 \
+        --output [$PREFIX, ] \
+        --interpolation Linear --use-histogram-matching 1 --winsorize-image-intensities [0.005,0.995] \
+        --initial-moving-transform "[$FIXED,$MOVING,1]" \
+        --transform Rigid[0.1] --metric MI[$FIXED,$MOVING,1,32,Regular,0.25] \
+        --convergence 1000x500x250x100 --shrink-factors 8x4x2x1 --smoothing-sigmas 3x2x1x0vox
+}
+
+function align_to_atlas() {
+    INPUT=$1
+    OUTPUT=$2
+    shift 2
+    TFMS="$@"
+
+    ants antsApplyTransforms -d 3 -i $INPUT -r $DSURQE -o $OUTPUT $TFMS
+}
+
+function split_heads() {
+    MAPS='S0 FA MD'
+    for MAP in ${MAPS}; do
+        IMAGE="$OUT_DIR/${SUBJECTS}_dti_${MAP}.nii.gz"
+
+        # split heads into individual images
+        $TBM_SCRIPT_DIR/split4HeadExvivo.py  \
+            $IMAGE \
+            $DTI_MASK $DTI_LABELS \
+            -o $ORIENTATION -v IS
+
+        SPLIT_IMAGES=($(ls -d ${IMAGE%.nii.gz}_?.nii.gz))
+        for (( n=0; n < ${#SPLIT_IMAGES[@]}; n++ )); do
+            FNAME=$( basename ${SPLIT_IMAGES[n]} )
+            FNAME=${FNAME##*${SUBJECTS}}
+            FNAME=${FNAME%%.*}
+            IDX=${FNAME: -1}
+            FNAME=${FNAME%_?}
+            SUBJ=$( echo "sub-${SUBJARR[IDX-1]}" | tr -d '\n' )
+            if [ $SUBJ == 'none' ] || [ $SUBJ == 'x' ]; then
+                continue
+            fi
+            DWI_DIR="$PROC_DIR/$SUBJ/dwi"
+            ANAT_DIR="$PROC_DIR/$SUBJ/anat"
+            mkdir -p $DWI_DIR
+            OUTNAME="$DWI_DIR/${SUBJ}${FNAME}.nii.gz"
+            mv ${SPLIT_IMAGES[n]} $OUTNAME
+
+            if [[ $MAP == 'S0' ]] && [ ! -f $DWI_DIR/${SUBJ}_DTItoT2w_0GenericAffine.mat ]; then
+                align_intrasubject $OUTNAME \
+                    $ANAT_DIR/${SUBJ}_T2w.nii.gz \
+                    $DWI_DIR/${SUBJ}_DTItoT2w_
+            fi
+            TFMS="-t $ANAT_DIR/${SUBJ}_0GenericAffine.mat -t $ANAT_DIR/${SUBJ}.tfm -t $DWI_DIR/${SUBJ}_DTItoT2w_0GenericAffine.mat"
+            ALIGNED="${OUTNAME%_${MAP}.nii.gz}_desc-aligned_${MAP}.nii.gz"
+            align_to_atlas $OUTNAME $ALIGNED $TFMS
+        done
+    done
+}
+
+preproc
+do_dti
+split_heads
